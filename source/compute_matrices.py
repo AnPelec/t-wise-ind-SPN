@@ -43,7 +43,7 @@ def multiply(start, end, index):
     C -- number of compressed layouts
     F -- number of full layouts
 """
-def compute_CF_matrix(C, F):
+def compute_CF_matrix():
     
     CF = np.zeros((C, F), dtype=object)
 
@@ -88,7 +88,7 @@ def compute_CF_matrix(C, F):
     C -- number of compressed layouts
     F -- number of full layouts
 """
-def compute_FC_matrix(C, F):
+def compute_FC_matrix():
 
     FC = np.zeros((F, C), dtype=object)
 
