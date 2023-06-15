@@ -1,61 +1,75 @@
-import copy
-import tqdm
-import random
-import itertools
-from functools import *
-from multiprocess import Process
-
-import math
 import numpy as np
-from mpmath import *
-from pyfinite import ffield
 
-import seaborn as sns
-from tabulate import tabulate
-from matplotlib import pyplot as plt
-from matplotlib.colors import LogNorm
+# AES plaintext is arranged as a 4x4 matrix of elements of F_{256}.
+k = 4
+k_square = 16
 
-k = 4 # even though AES has 16 blocks, its mixing is full-branch
-      # when viewed as a linear mapping from F^4 -> F^4 (i.e. between columns)
-K = 16
-# a compressed layout stores the Hamming weight of the layout columns
-# Hence each Hamming weight can map to 1, 4, or 6 distinct layout columns
-# For our matrices to have integer entries, we multiply everything by
-# LCM(4, 6)^4 = 20736
-COMMON_DENOMINATOR = 20736
+# The number of full layouts is 2^{k_square} - 1 (all possible subsets of kxk
+# elements) except the empty set
+F = 2**k_square - 1
+# The number of compressed layouts is (k+1)^k - 1 (each one of the k columns
+# has Hamming weight 0 to k), except the empty set
+C = (k+1)**k - 1
 
-def get_column_transition_probability(start_weight, end_weight, denominator):
-    """Compute the column transition probability.
+# Compressed layout: list of length k that stores at the ith position
+#   the Hamming weight of the ith layout column.
+#                               [1 0 0 1]
+# e.g. the compressed layout of [1 0 1 1] is [4 1 2 3].
+#                               [1 1 1 1]
+#                               [1 0 0 0]
+# Note that two distinct layouts can map to the same compressed layout.
+# A Hamming weight of 0, 1, 2, 3, 4 maps to
+#                     1, 4, 6, 4, 1 distinct layout columns respectively.
+# To avoid precision errors, we will scale the entries of the CF matrix
+#   to become integers. The original entries of CF are fractions with the
+#   number of layouts in a compressed layout in the denominator. A common
+#   multiple of these denominators is LCM(1, 4, 6, 4, 1)^4 = 20736.
+CF_SCALE = 20736
+
+# The transition probabilities of Lemma 11 (TODO fix ref) have powers of
+# 255 as a denominator. We scale the probabilities by 255 to keep the entries
+# of our transition matrices as integers.
+PROB_SCALE = 255
+
+# The total scaling of the FC matrix is (PROB_SCALE**3)**k = PROB_SCALE**12
+FC_SCALE = PROB_SCALE**12
+
+# Scale of CC matrix (which is the product of CF and FC) is their product
+CC_SCALE = CF_SCALE*FC_SCALE
+
+
+""" Compute the column transition probability.
     Uses the exact formula from Lemma 11 of Section 6 and substitutes k = 4
+    (TODO) update the number of the Lemma
 
     Keyword arguments:
     start_weight -- (Hamming) weight of the starting layout
     end_weight -- (Hamming) weight of the ending layout
-    denominator -- scales the probability to make it a whole number
-        and avoid precision errors accummulating
-    """
-
+    scale -- scales the probability to make it a whole number
+        and avoid precision errors accummulating. The total scale is scale**3
+"""
+def get_column_transition_prob(start_weight, end_weight, scale=PROB_SCALE):
     if start_weight == 1:
         if end_weight == 4:
-            return denominator**3
+            return scale**3
         else:
             return 0
         
     elif start_weight == 2:
         if end_weight == 3:
-            return denominator**2
+            return scale**2
         elif end_weight == 4:
-            return denominator**3 - 4*denominator**2
+            return scale**3 - 4*scale**2
         else:
             return 0
         
     elif start_weight == 3:
         if end_weight == 2:
-            return denominator
+            return scale
         elif end_weight == 3:
-            return denominator**2 - 4*denominator
+            return scale**2 - 4*scale
         elif end_weight == 4:
-            return denominator**3 - 4*denominator**2 + 10*denominator
+            return scale**3 - 4*scale**2 + 10*scale
         else:
             return 0
         
@@ -63,130 +77,121 @@ def get_column_transition_probability(start_weight, end_weight, denominator):
         if end_weight == 1:
             return 1
         elif end_weight == 2:
-            return denominator - 4
+            return scale - 4
         elif end_weight == 3:
-            return denominator**2 - 4*denominator + 10
+            return scale**2 - 4*scale + 10
         elif end_weight == 4:
-            return denominator**3 - 4*denominator**2 + 10*denominator - 20
+            return scale**3 - 4*scale**2 + 10*scale - 20
         else:
             return 0
         
     elif start_weight == 0:
         if end_weight == 0:
-            return denominator**3
+            return scale**3
         else:
             return 0
     else:
         return -1
 
-# UTILS
 
-def get_layout_index(layout):
-    """ Return the index of the layout.
+
+
+
+
+""" Return the index of the layout.
 
     Keyword arguments:
-    layout -- layout arranged as a 4x4 array of bits
-    """
+    layout -- layout arranged as a kxk array of bits
+"""
+def get_layout_index(layout):
+    # flatten layout
     flat_layout = layout.flatten()
+    # interpret layout as a binary number
     index = 0
-    for i in range(flat_layout.shape[0]):
+    for i in range(k_square):
         index *= 2
         index += flat_layout[i]
         
-    return index
+    # correct index to account for the fact that
+    # the all-zeros layout is not valid
+    return index - 1
 
-def get_compressed_layout_index(compressed_layout):
-    """ Return the index of the compressed layout.
+
+
+
+
+
+
+""" Return the index of the compressed layout.
 
     Keyword arguments:
-    compressed_layout -- compressed layout arranged as a list of
-        numbers from 0 to 4
-    """
+    compr_layout -- compressed layout arranged as a list of k
+        numbers from 0 to k+1
+"""
+def get_compr_layout_index(compr_layout):
+    # interpret layout as a number in base (k+1)
     index = 0
-    for i in range(len(compressed_layout)):
-        index *= 5
-        index += compressed_layout[i]
-        
-    return index
+    for i in range(len(compr_layout)):
+        index *= (k+1)
+        index += compr_layout[i]
+    
+    # correct index to account for the fact that
+    # the all-zeros layout is not valid
+    return index - 1
 
-def get_layout_by_index(index, k, K):
-    """ Return the layout given its index
+
+
+
+
+""" Return the layout given its index
     The indexing just views the layout as a binary string
 
     Keyword arguments:
     index -- index of the layout we want to obtain
-    """
+"""
+def get_layout_by_index(index):
+    # index starts from 0, but the all-zeros layout is not valid
+    _index = index +  1
+
     C = np.zeros((k, k)).astype(int)
-    for i in range(K):
-        C[k-1-i//k, k-1-i%k] = index%2
-        index //= 2
+    for i in range(k_square):
+        C[k-1-i//k, k-1-i%k] = _index%2
+        _index //= 2
     return C
 
-def get_compressed_layout_by_index(index, k):
-    """ Return the compressed layout given its index
-    The indexing just views the layout as a number in base 5
+
+
+
+
+
+
+""" Return the compressed layout given its index
+    The indexing just views the layout as a number in base k+1
 
     Keyword arguments:
     index -- index of the layout we want to obtain
-    """
-    compressed_layout = []
-    for i in range(k):
-        compressed_layout.append(index%5)
-        index //= 5
-    return compressed_layout[::-1]
+"""
+def get_compr_layout_by_index(index):
+    # index starts from 0, but the all-zeros layout is not valid
+    _index = index +  1
 
-def shift_rows(layout, k):
-    """ Apply the ShiftRows operation on the layout """
+    compr_layout = []
+    for i in range(k):
+        compr_layout.append(_index % (k+1))
+        _index //= (k+1)
+    return compr_layout[::-1]
+
+
+
+
+
+
+""" Apply the ShiftRows operation on the layout
+
+    Keyword arguments:
+    layout -- layout arranged as a kxk array of bits
+"""
+def shift_rows(layout):
     for i in range(k):
         layout[i, :] = list(layout[i, i:]) + list(layout[i, :i])
     return layout
-
-"""
-Verify matrices
-"""
-
-def verify_CF_matrix(CF):
-    """ Verify CF matrix """
-    invalid = False
-    for i in range(C):
-        if sum(CF[i]) != COMMON_DENOMINATOR:
-            invalid = True
-            break
-
-    if not invalid:
-        return True
-    else:
-        return False
-
-def verify_FC_matrix(FC):
-    """ Verify FC matrix """
-    invalid = False
-    for i in range(F):
-        if sum(FC[i]) != 255**12:
-            invalid = True
-            break
-            
-    if not invalid:
-        return True
-    else:
-        return False
-
-"""
-Small tests
-"""
-
-def small_tests(CC, CC_pow2, CC_pow8):
-    for i in range(C):
-        if sum(CC[i]) != COMMON_DENOMINATOR*255**12:
-            print(i)
-    print('done')
-
-    for i in range(C):
-        if sum(CC_pow2[i]) != (COMMON_DENOMINATOR*255**12)**2:
-            print(i)
-    print('done')
-
-    for i in range(C):
-        if sum(CC_pow8[i]) != (COMMON_DENOMINATOR*255**12)**8:
-            print(i)
-    print('done')
