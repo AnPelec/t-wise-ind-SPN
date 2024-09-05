@@ -3,7 +3,6 @@ from tabulate import tabulate
 
 import math
 import numpy as np
-import pandas as pd
 from pyfinite import ffield
 
 """ Compute base ** exponent over field F.
@@ -60,7 +59,7 @@ def get_INV_transition_matrix(b):
         for key in range(n):
             # compute difference after S-box
             inter_value = F.Add(x, key)
-            y = F.Add(INV(inter_value, F), INV(key, F))
+            y = F.Add(INV(inter_value, n, F), INV(key, n, F))
             # we transition from x to y (-1 to keep the matrix 0-index)
             T[x-1, y-1] += 1
             
